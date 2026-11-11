@@ -1,1000 +1,755 @@
 """
-title: Multi-Model Manifold Pipe with Safety Settings with gemini
-author: Andres Eufrasio (andres.eufrasiotinajero@gmail.com)
-version: 0.0.3
+title: Multi-Model Manifold Pipe for Vertex AI (Gemini / Claude / Llama)
+author: Feynman Liang + Andres Eufrasio (updated)
+version: 0.1.0
 license: MIT
-
-Decsiption:
-Fork based on Feynman Liang (feynman@blueteam.ai
-this is a Manifold Pipe for google vertex that has added functionality so that global servers work
-control the model's values based on the constants at the top.
+requirements: google-auth, requests
 """
 
+import asyncio
+import base64
+import hashlib
 import json
-from pydantic import BaseModel, Field
-from typing import Union, Iterator, List
-from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession
+import time
+from datetime import datetime, timezone
+from typing import Iterator, List, Optional, Tuple, Union
 
-# Set DEBUG to True to enable detailed logging
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2 import service_account
+from pydantic import BaseModel, Field
+
 DEBUG = False
 
-# Set these to easily control your model
-TEMP = 1.7
-TOPP = 0.98
+# Default sampling params (used only if the request doesn't provide them)
+TEMP = 1.0  # Gemini 3 recommends leaving temperature at 1.0
+TOPP = 0.95
 TOPK = 64
+DEFAULT_MAX_TOKENS = 8192  # thinking models need headroom
+
+
+def _log(*args):
+    if DEBUG:
+        print(*args)
+
+
+def _split_models(csv: str) -> List[str]:
+    return [m.strip() for m in csv.split(",") if m.strip()]
+
+
+def _text_of(content) -> str:
+    """Flatten OpenAI-style content (str or list of parts) to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return ""
+
+
+def _parse_data_url(url: str) -> Optional[Tuple[str, str]]:
+    """'data:image/png;base64,XXXX' -> ('image/png', 'XXXX')."""
+    if not url.startswith("data:") or ";base64," not in url:
+        return None
+    header, data = url.split(";base64,", 1)
+    return header[len("data:") :], data
+
+
+def _strip_function_prefix(model_id: str) -> str:
+    """Open WebUI prepends "<function_id>." to model IDs. Function IDs contain no
+    dots, so drop everything up to the first dot unless the ID already starts
+    with a known model family."""
+    if "." in model_id and not model_id.startswith(
+        ("gemini", "claude", "llama", "meta/")
+    ):
+        return model_id.split(".", 1)[1]
+    return model_id
+
+
+DEFAULT_PRICING = {
+    # USD per 1M tokens. "until" = last day (UTC) a tier applies; no "until" = open-ended.
+    "gemini-4-carbon": [
+        {"until": "2026-11-30", "in": 2, "out": 10},
+        {"in": 4, "out": 20},
+    ],
+    "gemini-4-argon": [
+        {"until": "2026-11-30", "in": 2, "out": 10},
+        {"in": 4, "out": 20},
+    ],
+    "gemini-3.8-flash": [
+        {"until": "2026-12-31", "in": 0.75, "out": 3.75},
+        {"in": 1.5, "out": 7.5},
+    ],
+    "gemini-3.7-flash": [
+        {"until": "2026-12-31", "in": 0.75, "out": 3.75},
+        {"in": 1.5, "out": 7.5},
+    ],
+    "gemini-3.6-flash": [
+        {"until": "2026-12-31", "in": 0.75, "out": 3.75},
+        {"in": 1.5, "out": 7.5},
+    ],
+}
+
+
+def _usage(prompt=0, completion=0) -> dict:
+    prompt, completion = int(prompt or 0), int(completion or 0)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
+def _usage_sse(usage: dict) -> str:
+    """Raw SSE chunk Open WebUI uses to fill the message's info popover."""
+    return "data: " + json.dumps({"choices": [], "usage": usage})
+
+
+def _completion(model: str, text: str, usage: dict) -> dict:
+    return {
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage,
+    }
+
+
+def _gemini_usage(meta: dict) -> dict:
+    # thinking tokens are billed as output, so count them as completion tokens
+    return _usage(
+        meta.get("promptTokenCount"),
+        (meta.get("candidatesTokenCount") or 0) + (meta.get("thoughtsTokenCount") or 0),
+    )
+
+
+def _claude_usage(u: dict) -> dict:
+    prompt = (
+        (u.get("input_tokens") or 0)
+        + (u.get("cache_creation_input_tokens") or 0)
+        + (u.get("cache_read_input_tokens") or 0)
+    )
+    return _usage(prompt, u.get("output_tokens"))
 
 
 class Pipe:
     class Valves(BaseModel):
-        PROJECT_ID: str = Field(
-            default="",  # Set this to your Project ID
-            description="Your Google Cloud Project ID.",
-        )
+        PROJECT_ID: str = Field(default="", description="Google Cloud project ID.")
         LOCATION: str = Field(
-            default="", description="Default region for Vertex AI models."
+            default="global",
+            description="Region for Gemini. Gemini 3.x previews require 'global'.",
+        )
+        CLAUDE_LOCATION: str = Field(
+            default="us-east5",
+            description="Region for Claude models ('global' also works for newer ones).",
+        )
+        LLAMA_LOCATION: str = Field(
+            default="us-central1", description="Region for Llama (MaaS) models."
         )
         SERVICE_ACCOUNT_JSON: str = Field(
-            default="", description="Service Account JSON"
+            default="", description="Service account JSON (full contents)."
+        )
+        GEMINI_MODELS: str = Field(
+            default="gemini-4-carbon,gemini-4-argon,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash",
+            description="Comma-separated Gemini model IDs.",
+        )
+        CLAUDE_MODELS: str = Field(
+            default="claude-sonnet-4-5@20250929,claude-haiku-4-5@20251001",
+            description="Comma-separated Claude model IDs as shown in Vertex Model Garden (blank to disable).",
+        )
+        LLAMA_MODELS: str = Field(
+            default="",
+            description="Comma-separated Llama MaaS IDs, e.g. llama-3.3-70b-instruct-maas (blank to disable).",
+        )
+        GEMINI_SAFETY_THRESHOLD: str = Field(
+            default="OFF",
+            description="OFF, BLOCK_NONE, BLOCK_ONLY_HIGH, BLOCK_MEDIUM_AND_ABOVE or BLOCK_LOW_AND_ABOVE.",
+        )
+        SHOW_USAGE: bool = Field(
+            default=True,
+            description="Report token usage to Open WebUI (the info popover on each message).",
+        )
+        SHOW_STATUS: bool = Field(
+            default=True,
+            description="Show live status messages (sending / generating / done summary).",
+        )
+        SHOW_COST: bool = Field(
+            default=True,
+            description="Add an estimated USD cost to the usage info and the done status.",
+        )
+        USD_TO_GBP: float = Field(
+            default=0.75,
+            description="USD to GBP rate used to convert estimated costs (prices are in USD).",
+        )
+        PRICING_JSON: str = Field(
+            default=json.dumps(DEFAULT_PRICING),
+            description=(
+                "USD per 1M tokens by model-ID prefix: "
+                '{"model-prefix": [{"until": "YYYY-MM-DD", "in": 1, "out": 5}, {"in": 2, "out": 10}]}. '
+                "First tier whose 'until' hasn't passed is used. Models not listed show no cost."
+            ),
         )
 
     def __init__(self):
-        self.id = "vertex_ai_streaming"  # Set this to your function's ID in OpenWebUI
+        self.id = "vertex_ai_streaming"  # must match this function's ID in OpenWebUI
         self.type = "manifold"
         self.name = "Vertex "
         self.valves = self.Valves()
-        self.credentials = None  # Initialize credentials attribute
-        self.authed_session = None
+        self.credentials = None
+        self.authed_session: Optional[AuthorizedSession] = None
+        self._cred_hash = None
 
+    # ------------------------------------------------------------------ auth
     def _ensure_auth(self):
-        # Only authenticate if session is not already created or credentials changed
-        if not self.authed_session or not self.credentials:
-            if not self.valves.SERVICE_ACCOUNT_JSON:
-                raise ValueError("SERVICE_ACCOUNT_JSON is not configured in Valves.")
-            try:
-                credentials_info = json.loads(self.valves.SERVICE_ACCOUNT_JSON)
-                self.credentials = (
-                    service_account.Credentials.from_service_account_info(
-                        credentials_info,
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                    )
-                )
-                self.authed_session = AuthorizedSession(self.credentials)
-                if DEBUG:
-                    print("Authentication successful.")
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Error decoding SERVICE_ACCOUNT_JSON: {e}")
-            except Exception as e:
-                raise ConnectionError(f"Failed to authenticate with Google Cloud: {e}")
-
-    def pipes(self) -> List[dict]:
-        # Return a list of models
-        return [
-            {"id": "gemini-2.5-pro-preview-06-05", "name": "Gemini-2.5-pro-preview"},
-            {"id": "gemini-3.1-pro-preview", "name": "Gemini-3.1-prev"},
-            # Eample commented-out models
-            # {"id": "claude-3-5-sonnet-v2@20241022", "name": "Claude 3.5 Sonnet V2"},
-            # {"id": "claude-3-haiku@20240307", "name": "Claude 3 Haiku"},
-            # {"id": "llama3-8b-instruct-tune", "name": "Llama 3 8B Instruct"}, # Example Llama model
-        ]
-
-    def pipe(self, body: dict) -> Union[str, Iterator[str]]:
+        sa_json = self.valves.SERVICE_ACCOUNT_JSON
+        if not sa_json:
+            raise ValueError("SERVICE_ACCOUNT_JSON is not configured in Valves.")
+        h = hashlib.sha256(sa_json.encode()).hexdigest()
+        if self.authed_session and self._cred_hash == h:
+            return  # AuthorizedSession refreshes expired tokens itself
         try:
-            self._ensure_auth()  # Ensure authentication is done first
+            info = json.loads(sa_json)
+            self.credentials = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            self.authed_session = AuthorizedSession(self.credentials)
+            self._cred_hash = h
+            _log("Authentication successful.")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Error decoding SERVICE_ACCOUNT_JSON: {e}")
+        except Exception as e:
+            raise ConnectionError(f"Failed to authenticate with Google Cloud: {e}")
+
+    # ----------------------------------------------------------------- models
+    def pipes(self) -> List[dict]:
+        models = []
+        for m in _split_models(self.valves.GEMINI_MODELS):
+            models.append({"id": m, "name": m})
+        for m in _split_models(self.valves.CLAUDE_MODELS):
+            models.append({"id": m, "name": m.split("@")[0]})
+        for m in _split_models(self.valves.LLAMA_MODELS):
+            models.append({"id": m, "name": m})
+        return models
+
+    # ------------------------------------------------------------------ utils
+    def _base(self, location: str, api: str = "v1") -> str:
+        host = (
+            "aiplatform.googleapis.com"
+            if location == "global"
+            else f"{location}-aiplatform.googleapis.com"
+        )
+        return (
+            f"https://{host}/{api}/projects/{self.valves.PROJECT_ID}"
+            f"/locations/{location}"
+        )
+
+    @staticmethod
+    def _sse_json(response) -> Iterator[dict]:
+        """Yield parsed JSON objects from an SSE response."""
+        for raw in response.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                yield json.loads(payload)
+            except json.JSONDecodeError as e:
+                _log(f"Bad SSE chunk: {e}: {payload[:200]}")
+
+    # ------------------------------------------------------- cost / status utils
+    def _estimate_cost(self, model_id: str, usage: dict) -> Optional[float]:
+        try:
+            table = json.loads(self.valves.PRICING_JSON or "{}")
+        except json.JSONDecodeError:
+            return None
+        keys = [k for k in table if model_id.startswith(k)]
+        if not keys:
+            return None
+        today = datetime.now(timezone.utc).date().isoformat()
+        for tier in table[max(keys, key=len)]:
+            if "until" not in tier or today <= tier["until"]:
+                return (
+                    (usage.get("prompt_tokens") or 0) * tier["in"]
+                    + (usage.get("completion_tokens") or 0) * tier["out"]
+                ) / 1e6
+        return None
+
+    def _add_cost(self, model_id: str, usage: dict) -> dict:
+        if self.valves.SHOW_COST:
+            cost = self._estimate_cost(model_id, usage)
+            if cost is not None:
+                usage = {
+                    **usage,
+                    "estimated_cost_gbp": round(cost * self.valves.USD_TO_GBP, 6),
+                    "estimated_cost_usd": round(cost, 6),
+                }
+        return usage
+
+    async def _emit(self, emitter, text: str, done: bool = False):
+        if not emitter or not self.valves.SHOW_STATUS:
+            return
+        try:
+            await emitter(
+                {"type": "status", "data": {"description": text, "done": done}}
+            )
+        except Exception as e:  # never let a status failure break the reply
+            _log("status emit failed:", e)
+
+    @staticmethod
+    def _summary(usage: Optional[dict], started: float) -> str:
+        parts = ["Done"]
+        if usage:
+            parts.append(
+                f"{usage.get('prompt_tokens', 0):,} in / "
+                f"{usage.get('completion_tokens', 0):,} out"
+            )
+            if usage.get("estimated_cost_gbp") is not None:
+                parts.append(f"~£{usage['estimated_cost_gbp']:.4f}")
+        parts.append(f"{time.monotonic() - started:.1f}s")
+        return " · ".join(parts)
+
+    async def _astream(self, it, model_id: str, emitter, started: float):
+        """Wrap the blocking sync generator so the event loop (and status
+        updates) stay responsive, and attach cost to the usage chunk."""
+        sentinel = object()
+        usage = None
+        first = True
+        try:
+            while True:
+                item = await asyncio.to_thread(next, it, sentinel)
+                if item is sentinel:
+                    break
+                if first:
+                    first = False
+                    await self._emit(emitter, f"Generating with {model_id}…")
+                if isinstance(item, str) and item.startswith("data: "):
+                    try:
+                        d = json.loads(item[len("data: ") :])
+                        if d.get("usage"):
+                            usage = self._add_cost(model_id, d["usage"])
+                            d["usage"] = usage
+                            item = "data: " + json.dumps(d)
+                    except json.JSONDecodeError:
+                        pass
+                yield item
+        finally:
+            # always clear the "Sending/Generating" status, even if the stream
+            # is closed early by the client
+            await self._emit(emitter, self._summary(usage, started), done=True)
+
+    # ------------------------------------------------------------------- main
+    async def pipe(self, body: dict, __event_emitter__=None, __task__=None):
+        started = time.monotonic()
+        model_id = _strip_function_prefix(body.get("model") or "")
+        # Background jobs (title / tags / follow-up generation) reuse the chat's
+        # emitter and would overwrite the real reply's status, so stay quiet.
+        emitter = None if __task__ else __event_emitter__
+        await self._emit(emitter, f"Sending to {model_id}…")
+
+        result = await asyncio.to_thread(self._pipe_sync, body)
+
+        if isinstance(result, str):
+            ok = not result.startswith("Error")
+            await self._emit(
+                emitter,
+                self._summary(None, started) if ok else result[:120],
+                done=True,
+            )
+            return result
+        if isinstance(result, dict):
+            usage = result.get("usage")
+            if usage:
+                usage = self._add_cost(model_id, usage)
+                result["usage"] = usage
+            await self._emit(emitter, self._summary(usage, started), done=True)
+            return result
+        return self._astream(result, model_id, emitter, started)
+
+    def _pipe_sync(self, body: dict) -> Union[str, dict, Iterator[str]]:
+        try:
+            self._ensure_auth()
         except (ValueError, ConnectionError) as e:
-            if DEBUG:
-                print(f"Authentication error: {e}")
             return f"Error: {e}"
 
-        project_id = self.valves.PROJECT_ID
-        default_location = self.valves.LOCATION
-
-        if not project_id:
+        if not self.valves.PROJECT_ID:
             return "Error: PROJECT_ID is not configured in Valves."
-        if not default_location:
-            return "Error: LOCATION is not configured in Valves."
 
         model_id = body.get("model")
-        stream = body.get("stream", False)
-
         if not model_id:
             return "Error: No model specified."
 
-        if DEBUG:
-            print(f"Original model_id: {model_id}")
-
-        # Remove the function ID prefix if present
-        function_id_with_dot = f"{self.id}."
-        if model_id.startswith(function_id_with_dot):
-            model_id = model_id[len(function_id_with_dot) :]
-            if DEBUG:
-                print(
-                    f"Removed prefix '{function_id_with_dot}' from model_id, new model_id: {model_id}"
-                )
-        else:
-            if DEBUG:
-                print("No prefix to remove from model_id.")
-
-        if DEBUG:
-            print(f"Using model_id: {model_id}")
+        model_id = _strip_function_prefix(model_id)
 
         try:
-            # Determine which model is selected and call the appropriate method
             if model_id.startswith("gemini"):
-                return self.call_gemini_model(
-                    body, project_id, default_location, model_id
-                )
-            elif model_id.startswith("claude"):
-                # Use 'us-east5' for Claude models - Check if this is still the recommended region
-                claude_location = "us-east5"
-                if DEBUG:
-                    print(
-                        f"Using location '{claude_location}' for Claude model: {model_id}"
-                    )
-                return self.call_claude_model(
-                    body, project_id, claude_location, model_id
-                )
-            elif model_id.startswith("llama"):
-                # Llama models might use the default location or a specific one
-                # Assuming default location here, adjust if needed
-                return self.call_llama_model(
-                    body, project_id, default_location, model_id
-                )
-            else:
-                return f"Error: Unknown or unsupported model ID: {model_id}"
+                return self.call_gemini_model(body, model_id)
+            if model_id.startswith("claude"):
+                return self.call_claude_model(body, model_id)
+            if model_id.startswith("llama") or model_id.startswith("meta/"):
+                return self.call_llama_model(body, model_id)
+            return f"Error: Unknown or unsupported model ID: {model_id}"
         except Exception as e:
             if DEBUG:
                 import traceback
 
-                print(f"Error in pipe method: {e}\n{traceback.format_exc()}")
-            return f"Error: An unexpected error occurred processing the request for model {model_id}. Details: {e}"
+                traceback.print_exc()
+            return f"Error: Unexpected failure for model {model_id}: {e}"
 
-    def call_gemini_model(self, body, project_id, location, model_id):
-        # Use the OpenAPI-spec compliant endpoint for chat completions
-        if location == "global":
-            url = (
-                f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/google/models/{model_id}:streamGenerateContent?alt=sse"
-                if body.get("stream", False)
-                else f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/google/models/{model_id}:generateContent"
-            )
-        else:
-            url = (
-                f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/google/models/{model_id}:streamGenerateContent?alt=sse"
-                if body.get("stream", False)
-                else f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/google/models/{model_id}:generateContent"
-            )
+    # ----------------------------------------------------------------- Gemini
+    def _gemini_parts(self, content) -> List[dict]:
+        if isinstance(content, str):
+            return [{"text": content}] if content else []
+        parts = []
+        for p in content or []:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "text" and p.get("text"):
+                parts.append({"text": p["text"]})
+            elif p.get("type") == "image_url":
+                url = (p.get("image_url") or {}).get("url", "")
+                parsed = _parse_data_url(url)
+                if parsed:
+                    parts.append(
+                        {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
+                    )
+        return parts
 
-        # --- Safety Settings Definition ---
-        # Define safety settings using the JSON structure expected by the REST API.
-        # Assuming 'BLOCK_NONE' as the threshold blocks nothing for that category.
-        # Adjust thresholds (e.g., BLOCK_LOW_AND_ABOVE, BLOCK_MEDIUM_AND_ABOVE, BLOCK_ONLY_HIGH)
-        # based on your requirements.
-        safety_settings_config = [
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-        ]
-        # --- End Safety Settings Definition ---
+    def format_gemini_contents(self, messages) -> Tuple[List[dict], Optional[dict]]:
+        """Return (contents, systemInstruction). Merges consecutive same-role turns."""
+        system_texts: List[str] = []
+        contents: List[dict] = []
+        for msg in messages:
+            role, content = msg.get("role"), msg.get("content")
+            if role == "system":
+                t = _text_of(content)
+                if t:
+                    system_texts.append(t)
+                continue
+            parts = self._gemini_parts(content)
+            if not parts:
+                continue
+            api_role = "model" if role == "assistant" else "user"
+            if contents and contents[-1]["role"] == api_role:
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": api_role, "parts": parts})
+        system = (
+            {"parts": [{"text": "\n\n".join(system_texts)}]} if system_texts else None
+        )
+        return contents, system
 
-        # Prepare the messages in the format required by the generateContent API
-        messages = body["messages"]
-        formatted_contents = self.format_gemini_contents(
-            messages
-        )  # Use specific Gemini formatting
-
-        # Prepare request data for the generateContent API
-        data = {
-            "contents": formatted_contents,
-            "generationConfig": {
-                "temperature": body.get(
-                    "temperature", TEMP
-                ),  # Default T for Gemini 1.5 Pro often higher
-                "maxOutputTokens": body.get(
-                    "max_tokens", 4240
-                ),  # Gemini 1.5 Pro default
-                "topP": body.get("top_p", TOPP),  # Gemini 1.5 Pro default
-                "topK": body.get("top_k", TOPK),  # A reasonable TopK for 1.5 Pro
-                # "stopSequences": ["example_stop_sequence"] # Optional: Add stop sequences if needed
-            },
-            "safetySettings": safety_settings_config,  # Include safety settings
-            # "tools": [] # Optional: Add tools if using function calling
-        }
-
-        # Remove stream parameter from generationConfig as it's handled by the endpoint choice
+    def call_gemini_model(self, body, model_id):
+        location = self.valves.LOCATION or "global"
         stream = body.get("stream", False)
+        # v1beta1 serves both GA and preview models
+        method = "streamGenerateContent?alt=sse" if stream else "generateContent"
+        url = (
+            f"{self._base(location, 'v1beta1')}/publishers/google/models/"
+            f"{model_id}:{method}"
+        )
 
-        if DEBUG:
-            print("Gemini Request URL:", url)
-            print("Gemini Request Data:", json.dumps(data, indent=2))
+        contents, system = self.format_gemini_contents(body["messages"])
+        if not contents:
+            return "Error: No non-empty messages to send."
+
+        threshold = self.valves.GEMINI_SAFETY_THRESHOLD
+        data = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": body.get("temperature", TEMP),
+                "maxOutputTokens": body.get("max_tokens", DEFAULT_MAX_TOKENS),
+                "topP": body.get("top_p", TOPP),
+                "topK": body.get("top_k", TOPK),
+            },
+            "safetySettings": [
+                {"category": c, "threshold": threshold}
+                for c in (
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "HARM_CATEGORY_HARASSMENT",
+                )
+            ],
+        }
+        if system:
+            data["systemInstruction"] = system
+        if body.get("stop"):
+            stop = body["stop"]
+            data["generationConfig"]["stopSequences"] = (
+                [stop] if isinstance(stop, str) else stop
+            )
+
+        _log("Gemini URL:", url)
 
         if stream:
-            # Use the streamGenerateContent endpoint logic
             return self._stream_gemini_response(url, data)
-        else:
-            # Use the generateContent endpoint logic
-            response = self.authed_session.post(url, json=data)
-            if response.status_code == 200:
-                response_data = response.json()
-                if DEBUG:
-                    print("Gemini Response Data:", json.dumps(response_data, indent=2))
 
-                # Extract text from the generateContent response structure
-                try:
-                    # Check for safety blocks first
-                    if response_data.get("promptFeedback", {}).get("blockReason"):
-                        reason = response_data["promptFeedback"]["blockReason"]
-                        message = (
-                            f"Request blocked due to prompt safety filters: {reason}"
-                        )
-                        if DEBUG:
-                            print(message)
-                        return f"Error: {message}"
+        resp = self.authed_session.post(url, json=data)
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} {resp.text}"
+        rdata = resp.json()
+        text = self._parse_gemini_chunk(rdata, final=True) or ""
+        if (
+            self.valves.SHOW_USAGE
+            and rdata.get("usageMetadata")
+            and not text.startswith("Error:")
+        ):
+            return _completion(model_id, text, _gemini_usage(rdata["usageMetadata"]))
+        return text
 
-                    if not response_data.get("candidates"):
-                        if DEBUG:
-                            print("No candidates found in response.")
-                        return (
-                            "Error: No response generated by the model (no candidates)."
-                        )
+    def _parse_gemini_chunk(self, chunk: dict, final: bool = False) -> Optional[str]:
+        """Extract visible text from one Gemini response object (or an error string)."""
+        reason = chunk.get("promptFeedback", {}).get("blockReason")
+        if reason:
+            return f"Error: Request blocked by prompt safety filters: {reason}"
 
-                    first_candidate = response_data["candidates"][0]
+        cands = chunk.get("candidates") or []
+        if not cands:
+            return "Error: No candidates returned by the model." if final else None
+        cand = cands[0]
 
-                    if first_candidate.get("finishReason") not in [
-                        "STOP",
-                        "MAX_TOKENS",
-                        None,
-                    ]:  # None for cases where it might be missing but content is present
-                        reason = first_candidate.get("finishReason", "Unknown")
-                        message = f"Content generation stopped due to: {reason}"
-                        safety_ratings = first_candidate.get("safetyRatings", [])
-                        if safety_ratings:
-                            message += f". Safety Ratings: {json.dumps(safety_ratings)}"
-                        if DEBUG:
-                            print(message)
-                        # Return error if blocked, otherwise might return partial content if available
-                        if reason == "SAFETY":
-                            return f"Error: {message}"
-                        # else: could potentially return partial content here if needed
+        parts = (cand.get("content") or {}).get("parts") or []
+        # Skip "thought" parts (Gemini 3 / 2.5 thinking summaries)
+        text = "".join(
+            p.get("text", "") for p in parts if "text" in p and not p.get("thought")
+        )
 
-                    if (
-                        "content" in first_candidate
-                        and "parts" in first_candidate["content"]
-                    ):
-                        generated_text = "".join(
-                            part.get("text", "")
-                            for part in first_candidate["content"]["parts"]
-                        )
-                        return generated_text
-                    else:
-                        if DEBUG:
-                            print("No content.parts found in the first candidate.")
-                        return "Error: No text content found in the model response."
-
-                except (IndexError, KeyError, TypeError) as e:
-                    if DEBUG:
-                        print(f"Error parsing Gemini response: {e}")
-                        print(
-                            "Response Data received:",
-                            json.dumps(response_data, indent=2),
-                        )
-                    return f"Error: Could not parse the response from the model. Structure might be unexpected. Details: {e}"
-            else:
-                error_message = f"Error: {response.status_code} {response.text}"
-                if DEBUG:
-                    print(error_message)
-                    print("Response Headers:", response.headers)
-                return error_message
+        finish = cand.get("finishReason")
+        if finish in (
+            "SAFETY",
+            "PROHIBITED_CONTENT",
+            "BLOCKLIST",
+            "SPII",
+            "RECITATION",
+        ):
+            note = f"\n\nError: generation stopped ({finish})."
+            return (text + note) if text else note.strip()
+        if final and not text:
+            return f"Error: Empty response (finishReason={finish})."
+        return text
 
     def _stream_gemini_response(self, url: str, data: dict) -> Iterator[str]:
-        """Stream the response from the Gemini streamGenerateContent API."""
-        response = self.authed_session.post(
+        resp = self.authed_session.post(
             url, json=data, stream=True, headers={"Accept": "text/event-stream"}
         )
-
-        if response.status_code != 200:
-            error_message = f"Error: {response.status_code} {response.text}"
-            if DEBUG:
-                print(error_message)
-                print("Response Headers:", response.headers)
-            yield error_message  # Yield error and stop
+        if resp.status_code != 200:
+            yield f"Error: {resp.status_code} {resp.text}"
             return
+        meta: dict = {}
+        for chunk in self._sse_json(resp):
+            meta = chunk.get("usageMetadata") or meta
+            text = self._parse_gemini_chunk(chunk)
+            if text:
+                yield text
+        if self.valves.SHOW_USAGE and meta:
+            yield _usage_sse(_gemini_usage(meta))
 
-        if DEBUG:
-            print("Starting to stream Gemini response...")
-
-        for line in response.iter_lines():
-            if line:
-                decoded_line = line.decode("utf-8")
-                if decoded_line.startswith("data:"):
-                    try:
-                        # Remove "data: " prefix and parse JSON
-                        content = decoded_line[len("data: ") :]
-                        # Handle potential multi-chunk lines in SSE (though less common with Vertex)
-                        if not content:
-                            continue  # Skip empty data lines
-
-                        json_response = json.loads(content)
-                        if DEBUG:
-                            print(
-                                "Streaming Gemini chunk:",
-                                json.dumps(json_response, indent=2),
-                            )
-
-                        # Check for prompt feedback block - happens early
-                        if json_response.get("promptFeedback", {}).get("blockReason"):
-                            reason = json_response["promptFeedback"]["blockReason"]
-                            error_msg = f"Error: Request blocked due to prompt safety filters: {reason}"
-                            if DEBUG:
-                                print(error_msg)
-                            yield error_msg
-                            return  # Stop streaming if prompt is blocked
-
-                        if (
-                            "candidates" in json_response
-                            and len(json_response["candidates"]) > 0
-                        ):
-                            candidate = json_response["candidates"][0]
-
-                            # Check for finish reason indicating block
-                            if candidate.get("finishReason") == "SAFETY":
-                                ratings = candidate.get("safetyRatings", "N/A")
-                                error_msg = f"Error: Content generation stopped due to safety filters. Ratings: {json.dumps(ratings)}"
-                                if DEBUG:
-                                    print(error_msg)
-                                yield error_msg
-                                # Potentially stop streaming here, or just yield the error and let it finish if other text came first? Yielding seems safer.
-                                return  # Stop streaming if content is blocked
-
-                            if (
-                                "content" in candidate
-                                and "parts" in candidate["content"]
-                            ):
-                                for part in candidate["content"]["parts"]:
-                                    if "text" in part:
-                                        yield part["text"]
-                    except json.JSONDecodeError as e:
-                        if DEBUG:
-                            print(
-                                f"Error decoding JSON stream chunk: {e}, Line: '{decoded_line}'"
-                            )
-                        # Continue to next line might be okay, or yield error?
-                        # yield f"Error decoding stream: {e}" # Option to notify client
-                        continue
-                    except Exception as e:
-                        if DEBUG:
-                            import traceback
-
-                            print(
-                                f"Error processing Gemini stream: {e}\n{traceback.format_exc()}"
-                            )
-                        # yield f"Error processing stream: {e}" # Option to notify client
-                        continue  # Continue processing stream if possible
-            # else: handle keep-alive or empty lines if necessary based on API behavior
-        if DEBUG:
-            print("Finished streaming Gemini response.")
-
-    # Helper function to format messages for Gemini generateContent API
-    def format_gemini_contents(self, messages):
-        formatted_contents = []
-        system_instruction = None  # Gemini specific: Separate system instruction
-
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content")
-
-            if not content:  # Skip empty messages
+    # ----------------------------------------------------------------- Claude
+    def _claude_content(self, content):
+        if isinstance(content, str):
+            return content
+        blocks = []
+        for p in content or []:
+            if not isinstance(p, dict):
                 continue
-
-            # Handle system messages - store the first one separately
-            if role == "system":
-                if system_instruction is None:  # Use the first system message
-                    system_instruction = {"parts": [{"text": content}]}
-                else:  # Append subsequent system messages as user messages (or log warning)
-                    if DEBUG:
-                        print(
-                            "Warning: Multiple system messages found. Using first as system instruction, adding others as user messages."
-                        )
-                    formatted_contents.append(
-                        {"role": "user", "parts": [{"text": f"System Note: {content}"}]}
+            if p.get("type") == "text" and p.get("text"):
+                blocks.append({"type": "text", "text": p["text"]})
+            elif p.get("type") == "image_url":
+                parsed = _parse_data_url((p.get("image_url") or {}).get("url", ""))
+                if parsed:
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": parsed[0],
+                                "data": parsed[1],
+                            },
+                        }
                     )
-                continue  # Move to next message after handling system message
+        return blocks
 
-            # Map "assistant" role to "model" for Gemini API
-            api_role = "model" if role == "assistant" else "user"
-
-            # Append user/assistant messages
-            formatted_contents.append({"role": api_role, "parts": [{"text": content}]})
-
-        # Prepend system instruction if it exists
-        if system_instruction:
-            # The generateContent API can take an explicit 'systemInstruction' field
-            # For simplicity here, we keep it within 'contents' as the first 'user' message
-            # Note: For optimal performance, using the dedicated system_instruction field
-            # might be better if restructuring the call logic.
-            # Adding it as the first element in contents - API usually handles turn order.
-            # A dedicated `system_instruction` field outside 'contents' is preferred in v1beta1.
-            # Let's structure payload later to include it correctly if needed.
-            # For now, prepend as a user message for compatibility, though less ideal.
-            # ***CORRECTION: Add system instruction correctly OUTSIDE contents if possible in payload***
-            # Let's adjust the `data` dict in `call_gemini_model` instead.
-            # For now, just return the formatted user/model contents.
-            # Return value structure: { "contents": [...], "system_instruction": {...} } if needed later.
-            pass  # System instruction handled separately in call_gemini_model if API supports it directly
-
-        # Let's assume for now we will pass system instruction separately if possible
-        # Or handle it by modifying the main data dict. Return just user/model turns here.
-        final_formatted_contents = []
-        current_role = None
-        current_parts = []
-
-        # Merge consecutive messages of the same role (required by Gemini API)
+    def format_claude_messages(self, messages) -> Tuple[List[dict], Optional[str]]:
+        system_parts: List[str] = []
+        out: List[dict] = []
         for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content")
-
-            if not content:
-                continue
-
+            role, content = msg.get("role"), msg.get("content")
             if role == "system":
-                # Handle system prompt - often best passed separately or as first user turn
-                # Let's assume first system message becomes a user message for simplicity here
-                if DEBUG:
-                    print(
-                        "Treating system message as the initial user message for content history."
-                    )
-                role = "user"  # Treat as user for content list
-
-            api_role = "model" if role == "assistant" else "user"
-
-            if api_role == current_role:
-                current_parts.append({"text": content})
+                t = _text_of(content)
+                if t:
+                    system_parts.append(t)
+                continue
+            if role not in ("user", "assistant"):
+                continue
+            c = self._claude_content(content)
+            if not c:
+                continue
+            if out and out[-1]["role"] == role:
+                # merge consecutive same-role turns
+                prev = out[-1]["content"]
+                if isinstance(prev, str):
+                    prev = [{"type": "text", "text": prev}]
+                if isinstance(c, str):
+                    c = [{"type": "text", "text": c}]
+                out[-1]["content"] = prev + c
             else:
-                # Finalize previous role block if it exists
-                if current_role is not None:
-                    final_formatted_contents.append(
-                        {"role": current_role, "parts": current_parts}
-                    )
+                out.append({"role": role, "content": c})
+        # Claude requires the first message to be from the user
+        if out and out[0]["role"] == "assistant":
+            out.insert(0, {"role": "user", "content": "(conversation start)"})
+        return out, ("\n\n".join(system_parts) if system_parts else None)
 
-                # Start new role block
-                current_role = api_role
-                current_parts = [{"text": content}]
-
-        # Append the last block
-        if current_role is not None:
-            final_formatted_contents.append(
-                {"role": current_role, "parts": current_parts}
-            )
-
-        return final_formatted_contents
-
-    # --- Claude and Llama methods remain largely unchanged, but ensure auth and error handling are robust ---
-
-    def call_claude_model(self, body, project_id, location, model_id):
-        # Note: Claude on Vertex might use a different endpoint structure.
-        # This uses the Anthropic publisher endpoint structure. Double-check documentation.
-        # The model ID format might be just `claude-3-opus@20240229` etc. without publisher prefix for some calls.
-        # Assuming the format requires the publisher:
-        # url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/anthropic/models/{model_id}:streamRawPredict?alt=sse" if body.get("stream", False) else f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/anthropic/models/{model_id}:rawPredict"
-        # Let's assume :predict endpoint for simplicity first, check if needs rawPredict/streamRawPredict
-        url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/anthropic/models/{model_id}:predict"
-
-        stream = body.get(
-            "stream", False
-        )  # Claude :predict might not support streaming directly? TBC
-        # Use :streamRawPredict for streaming Claude
-
-        if stream:
-            url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/anthropic/models/{model_id}:streamRawPredict?alt=sse"
-        else:
-            url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/anthropic/models/{model_id}:predict"
-            # url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/anthropic/models/{model_id}:rawPredict" # Use rawPredict for more control?
-
-        messages = body["messages"]
-        formatted_messages, system_prompt = self.format_claude_messages(messages)
-
-        # Prepare request data - structure depends on rawPredict vs predict
-        # Using the :predict structure (simpler, less control)
-        # data_predict = {
-        #     "instances": [{"prompt": formatted_prompt}], # Simple prompt string format
-        #     "parameters": { ... }
-        # }
-
-        # Using rawPredict/streamRawPredict structure (matches Anthropic API closer)
-        payload = {
-            "anthropic_version": "vertex-2023-10-16",  # Or newer version if available/needed
-            "messages": formatted_messages,
-            "temperature": body.get("temperature", 0.7),
-            "max_tokens": body.get("max_tokens", 1024),  # Claude often uses max_tokens
-            "top_p": body.get("top_p", 0.8),
-            "top_k": body.get("top_k", 40),
-            "stream": stream,
-            # Add system prompt if extracted
-            **({"system": system_prompt} if system_prompt else {}),
-        }
-
-        # Need to wrap payload correctly for Vertex rawPredict/streamRawPredict
-        data = {
-            "contents": [json.dumps(payload)]
-        }  # Wrap the JSON payload string inside 'contents' list for rawPredict
-
-        if not stream:
-            # For non-streaming :predict, structure is different:
-            data = {
-                "instances": [
-                    {
-                        "messages": formatted_messages,
-                        # Add system prompt if extracted and supported by :predict instance structure
-                        **({"system": system_prompt} if system_prompt else {}),
-                    }
-                ],
-                "parameters": {
-                    "anthropic_version": "vertex-2023-10-16",
-                    "temperature": body.get("temperature", 0.7),
-                    "maxOutputTokens": body.get("max_tokens", 1024),
-                    "topP": body.get("top_p", 0.8),
-                    "topK": body.get("top_k", 40),
-                    # Stream parameter might not be valid for non-streaming :predict
-                },
-            }
-            # Remove system from instance if it should be in parameters or is not supported by :predict
-            if (
-                "system" in data["instances"][0] and not False
-            ):  # Check if :predict supports system in instance
-                del data["instances"][0]["system"]
-                data["parameters"][
-                    "system"
-                ] = system_prompt  # Try putting in parameters if applicable
-
-        if DEBUG:
-            print("Claude Request URL:", url)
-            print("Claude Request Data:", json.dumps(data, indent=2))
-
-        if stream:
-            # Use streamRawPredict endpoint
-            return self._stream_claude_raw_predict_response(
-                url, {"contents": [json.dumps(payload)]}
-            )  # Ensure payload is correct for streamRawPredict
-        else:
-            # Use predict endpoint
-            response = self.authed_session.post(url, json=data)
-            if response.status_code == 200:
-                response_data = response.json()
-                if DEBUG:
-                    print("Claude Response Data:", json.dumps(response_data, indent=2))
-                try:
-                    # Parse response from :predict
-                    if (
-                        "predictions" in response_data
-                        and len(response_data["predictions"]) > 0
-                    ):
-                        # Structure of prediction depends on underlying model (Claude)
-                        # It might be {'content': [{'type': 'text', 'text': '...'}], ...}
-                        prediction_content = response_data["predictions"][
-                            0
-                        ]  # Get the first prediction object
-
-                        # Check for explicit content block based on safety
-                        if prediction_content.get("stopReason") == "max_tokens":
-                            if DEBUG:
-                                print(
-                                    "Warning: Output truncated due to max_tokens limit."
-                                )
-                        elif prediction_content.get("stopReason") not in [
-                            None,
-                            "stop_sequence",
-                            "end_turn",
-                        ]:
-                            reason = prediction_content.get("stopReason", "Unknown")
-                            # Claude safety stop reasons might differ, e.g., could be in a dedicated field or part of stopReason. Check docs.
-                            # Assuming a non-standard stopReason might indicate an issue.
-                            message = f"Content generation stopped potentially due to non-standard reason: {reason}"
-                            if DEBUG:
-                                print(message)
-                            # Decide if this is an error or just informational
-                            # return f"Error: {message}" # Example: treat as error
-
-                        # Extract text content
-                        generated_text = ""
-                        if isinstance(prediction_content.get("content"), list):
-                            for block in prediction_content["content"]:
-                                if block.get("type") == "text":
-                                    generated_text += block.get("text", "")
-                            return generated_text
-                        elif isinstance(
-                            prediction_content.get("content"), str
-                        ):  # Fallback if content is just a string
-                            return prediction_content.get("content", "")
-                        else:
-                            if DEBUG:
-                                print(
-                                    "Could not find expected text content block in Claude prediction."
-                                )
-                            return "Error: No text content found in the model response."
-
-                    else:
-                        if DEBUG:
-                            print("No predictions found in the Claude response.")
-                        return "Error: No response generated by the model (no predictions)."
-                except (IndexError, KeyError, TypeError) as e:
-                    if DEBUG:
-                        print(f"Error parsing Claude response: {e}")
-                        print(
-                            "Response Data received:",
-                            json.dumps(response_data, indent=2),
-                        )
-                    return f"Error: Could not parse the response from Claude model. Details: {e}"
-            else:
-                error_message = f"Error: {response.status_code} {response.text}"
-                if DEBUG:
-                    print(error_message)
-                    print("Response Headers:", response.headers)
-                return error_message
-
-    def _stream_claude_raw_predict_response(
-        self, url: str, data: dict
-    ) -> Iterator[str]:
-        """Stream the response from the Claude streamRawPredict API."""
-        response = self.authed_session.post(
-            url, json=data, stream=True, headers={"Accept": "text/event-stream"}
-        )
-
-        if response.status_code != 200:
-            error_message = f"Error: {response.status_code} {response.text}"
-            if DEBUG:
-                print(error_message)
-                print("Response Headers:", response.headers)
-            yield error_message
-            return
-
-        if DEBUG:
-            print("Starting to stream Claude response...")
-
-        for line in response.iter_lines():
-            if line:
-                decoded_line = line.decode("utf-8")
-                if decoded_line.startswith("data:"):
-                    try:
-                        content = decoded_line[len("data: ") :].strip()
-                        if not content:
-                            continue
-
-                        # streamRawPredict returns chunks of the raw Anthropic response stream
-                        # Each chunk needs to be parsed as JSON representing Anthropic stream events
-                        json_chunk = json.loads(content)
-                        if DEBUG:
-                            print(
-                                "Streaming Claude chunk:",
-                                json.dumps(json_chunk, indent=2),
-                            )
-
-                        event_type = json_chunk.get("type")
-
-                        if event_type == "content_block_delta":
-                            delta = json_chunk.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                yield delta.get("text", "")
-                        elif event_type == "message_stop":
-                            stop_reason = json_chunk.get("message", {}).get(
-                                "stop_reason"
-                            )
-                            if DEBUG:
-                                print(
-                                    f"Claude stream finished. Stop Reason: {stop_reason}"
-                                )
-                            # Check if stop reason indicates an error or safety block
-                            if stop_reason not in [
-                                "end_turn",
-                                "stop_sequence",
-                                "max_tokens",
-                            ]:
-                                # Handle other reasons like 'tool_use' or potential error states if needed
-                                warning_msg = f"Warning: Stream stopped due to reason: {stop_reason}"
-                                if DEBUG:
-                                    print(warning_msg)
-                                # Decide if you need to yield an error message here.
-                                # yield f"Error: {warning_msg}"
-                            break  # Stop iteration cleanly on message_stop
-                        elif event_type == "error":
-                            error_data = json_chunk.get("error", {})
-                            error_msg = f"Error from Claude stream: {error_data.get('type')} - {error_data.get('message')}"
-                            if DEBUG:
-                                print(error_msg)
-                            yield error_msg
-                            break  # Stop iteration on error
-
-                        # Handle other event types like 'message_start', 'content_block_start', etc. if needed
-
-                    except json.JSONDecodeError as e:
-                        if DEBUG:
-                            print(
-                                f"Error decoding JSON stream chunk: {e}, Line: '{decoded_line}'"
-                            )
-                        continue
-                    except Exception as e:
-                        if DEBUG:
-                            import traceback
-
-                            print(
-                                f"Error processing Claude stream: {e}\n{traceback.format_exc()}"
-                            )
-                        continue
-        if DEBUG:
-            print("Finished streaming Claude response.")
-
-    def call_llama_model(self, body, project_id, location, model_id):
-        # Placeholder for Llama model call
-        # Llama models might be served via specific endpoints (e.g., tuned models)
-        # or potentially the general openapi/chat/completions endpoint like Gemini
-        # Need to determine the correct endpoint and payload structure for Llama on Vertex AI
-        # Example using a hypothetical Llama endpoint or the generic one if applicable
-        # url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/YOUR_LLAMA_ENDPOINT_ID:predict"
-        # Or if using the chat completions compatible endpoint:
-        # url = f"https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/{location}/endpoints/openapi/chat/completions"
-        if DEBUG:
-            print(
-                f"Llama model call requested for {model_id}, but implementation is a placeholder."
-            )
-            print(
-                "Determine the correct Vertex AI endpoint and payload structure for Llama models."
-            )
-
-        # --- You would need to adapt the following based on the actual Llama endpoint ---
-        # Example assuming a compatible chat completions endpoint:
-        url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi/chat/completions"
+    def call_claude_model(self, body, model_id):
+        location = self.valves.CLAUDE_LOCATION or "us-east5"
         stream = body.get("stream", False)
-        messages = body["messages"]
-        formatted_messages = self.format_messages(messages)  # Use generic OA format
+        method = "streamRawPredict" if stream else "rawPredict"
+        url = f"{self._base(location)}/publishers/anthropic/models/{model_id}:{method}"
 
-        # Construct payload (might need adjustments for Llama specifics)
-        # Note: Llama model name likely needs publisher prefix, e.g., "meta/llama3-8b-instruct"
-        # Find the correct ID format in Vertex AI Model Garden / Registry
-        llama_formatted_model_id = f"meta/{model_id}"  # Example, adjust as needed
-        data = {
-            "model": llama_formatted_model_id,
-            "messages": formatted_messages,
-            "temperature": body.get("temperature", 0.6),  # Llama defaults might differ
-            "max_tokens": body.get("max_tokens", 1024),
-            "top_p": body.get("top_p", 0.9),
-            "top_k": body.get("top_k", 50),
+        messages, system = self.format_claude_messages(body["messages"])
+        if not messages:
+            return "Error: No non-empty messages to send."
+
+        # rawPredict takes the native Anthropic Messages body (model is in the URL)
+        payload = {
+            "anthropic_version": "vertex-2023-10-16",
+            "messages": messages,
+            "max_tokens": body.get("max_tokens", DEFAULT_MAX_TOKENS),
             "stream": stream,
-            # Safety settings might not be supported or use different structure for Llama endpoints
         }
+        if system:
+            payload["system"] = system
+        # Newer Claude models reject temperature + top_p together, so send only temperature
+        if "temperature" in body:
+            payload["temperature"] = body["temperature"]
+        if body.get("stop"):
+            stop = body["stop"]
+            payload["stop_sequences"] = [stop] if isinstance(stop, str) else stop
 
-        if DEBUG:
-            print("Hypothetical Llama Request URL:", url)
-            print("Hypothetical Llama Request Data:", json.dumps(data, indent=2))
+        _log("Claude URL:", url)
 
         if stream:
-            # Use the generic _stream_response if endpoint supports OpenAI SSE format
-            return self._stream_response(url, data)
-        else:
-            # Use generic POST request logic
-            response = self.authed_session.post(url, json=data)
-            if response.status_code == 200:
-                response_data = response.json()
-                if DEBUG:
-                    print("Llama Response Data:", json.dumps(response_data, indent=2))
-                # Parse response (assuming OpenAI compatible structure)
-                try:
-                    if "choices" in response_data and len(response_data["choices"]) > 0:
-                        generated_text = (
-                            response_data["choices"][0]
-                            .get("message", {})
-                            .get("content", "")
-                        )
-                        # Check finish reason for potential issues (e.g., length, safety)
-                        finish_reason = response_data["choices"][0].get("finish_reason")
-                        if finish_reason not in ["stop", None]:
-                            print(
-                                f"Warning: Llama generation finished due to: {finish_reason}"
-                            )
-                            if finish_reason == "length":
-                                # Optionally append a note about truncation
-                                generated_text += (
-                                    "\n[Output truncated due to length limit]"
-                                )
-                            elif finish_reason == "safety":
-                                return f"Error: Response blocked due to safety settings."  # Or return partial + error
-                        return generated_text
-                    else:
-                        if DEBUG:
-                            print("No choices found in Llama response.")
-                        return (
-                            "Error: No response generated by Llama model (no choices)."
-                        )
-                except (IndexError, KeyError, TypeError) as e:
-                    if DEBUG:
-                        print(f"Error parsing Llama response: {e}")
-                    return f"Error: Could not parse Llama response. Details: {e}"
+            return self._stream_claude_response(url, payload)
 
-            else:
-                error_message = f"Error: {response.status_code} {response.text}"
-                if DEBUG:
-                    print(error_message)
-                return error_message
+        resp = self.authed_session.post(url, json=payload)
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} {resp.text}"
+        data = resp.json()
+        text = "".join(
+            b.get("text", "")
+            for b in data.get("content", [])
+            if b.get("type") == "text"
+        )
+        if data.get("stop_reason") == "max_tokens":
+            text += "\n\n[Output truncated: max_tokens reached]"
+        if not text:
+            return "Error: No text content found in the model response."
+        if self.valves.SHOW_USAGE and data.get("usage"):
+            return _completion(model_id, text, _claude_usage(data["usage"]))
+        return text
 
-        # return "Error: Llama model support not fully implemented yet."
+    def _stream_claude_response(self, url: str, payload: dict) -> Iterator[str]:
+        resp = self.authed_session.post(
+            url, json=payload, stream=True, headers={"Accept": "text/event-stream"}
+        )
+        if resp.status_code != 200:
+            yield f"Error: {resp.status_code} {resp.text}"
+            return
+        usage: dict = {}
+        for ev in self._sse_json(resp):
+            t = ev.get("type")
+            if t == "message_start":
+                usage.update((ev.get("message") or {}).get("usage") or {})
+            elif t == "content_block_delta":
+                delta = ev.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    yield delta.get("text", "")
+            elif t == "message_delta":
+                usage.update(ev.get("usage") or {})
+                if ev.get("delta", {}).get("stop_reason") == "max_tokens":
+                    yield "\n\n[Output truncated: max_tokens reached]"
+            elif t == "message_stop":
+                break
+            elif t == "error":
+                err = ev.get("error", {})
+                yield f"Error from Claude stream: {err.get('type')} - {err.get('message')}"
+                return
+        if self.valves.SHOW_USAGE and usage:
+            yield _usage_sse(_claude_usage(usage))
 
-    # Generic formatter (OpenAI compatible structure)
-    def format_messages(self, messages):
-        formatted_messages = []
-        # The chat completions endpoint expects alternating user/assistant roles
-        # System message is often handled differently (first message or dedicated field)
-        system_prompt = None
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content")
-            if not content:
-                continue
+    # ------------------------------------------------------------------ Llama
+    def call_llama_model(self, body, model_id):
+        """Llama / other MaaS models via Vertex's OpenAI-compatible endpoint."""
+        location = self.valves.LLAMA_LOCATION or "us-central1"
+        url = f"{self._base(location)}/endpoints/openapi/chat/completions"
+        stream = body.get("stream", False)
 
-            if role == "system" and system_prompt is None:
-                system_prompt = content  # Capture first system prompt
-                # How it's used depends on the API, often placed first
-            elif role == "user":
-                formatted_messages.append({"role": "user", "content": content})
-            elif role == "assistant":
-                formatted_messages.append({"role": "assistant", "content": content})
-            elif role == "system":  # Handle subsequent system messages if any
-                if DEBUG:
-                    print(
-                        "Warning: Multiple system messages. Adding subsequent ones as user messages."
-                    )
-                formatted_messages.append(
-                    {"role": "user", "content": f"System Note: {content}"}
-                )
+        full_id = model_id if "/" in model_id else f"meta/{model_id}"
+        messages = []
+        for m in body["messages"]:
+            t = _text_of(m.get("content"))
+            if t and m.get("role") in ("system", "user", "assistant"):
+                messages.append({"role": m["role"], "content": t})
 
-        # Prepend system prompt as the first message if captured
-        if system_prompt:
-            # Check if last message was assistant, if so, can't prepend system (must alternate)
-            # This simple prepend assumes it's okay or first message. Real logic might need merging/adjusting turns.
-            formatted_messages.insert(
-                0, {"role": "system", "content": system_prompt}
-            )  # Use 'system' role if API supports it
+        data = {
+            "model": full_id,
+            "messages": messages,
+            "temperature": body.get("temperature", 0.6),
+            "max_tokens": body.get("max_tokens", 2048),
+            "top_p": body.get("top_p", 0.9),
+            "stream": stream,
+            **({"stream_options": {"include_usage": True}} if stream else {}),
+        }
+        _log("Llama URL:", url)
 
-        # Ensure correct turn order (user, assistant, user, ...) - API might enforce this
-        # Basic check: No two consecutive messages of the same role
-        final_messages = []
-        last_role = None
-        for msg in formatted_messages:
-            current_role = msg["role"]
-            # Simple merge strategy: Combine content if same role follows (basic)
-            # A more robust strategy might be needed depending on API strictness
-            if final_messages and current_role == last_role:
-                if DEBUG:
-                    print(f"Warning: Merging consecutive {current_role} messages.")
-                final_messages[-1]["content"] += "\n" + msg["content"]
-            else:
-                final_messages.append(msg)
-                last_role = current_role
+        if stream:
+            return self._stream_openai_response(url, data)
 
-        return final_messages
+        resp = self.authed_session.post(url, json=data)
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} {resp.text}"
+        rdata = resp.json()
+        choices = rdata.get("choices") or []
+        if not choices:
+            return "Error: No response generated (no choices)."
+        text = (choices[0].get("message") or {}).get("content", "") or ""
+        if choices[0].get("finish_reason") == "length":
+            text += "\n\n[Output truncated: max_tokens reached]"
+        u = rdata.get("usage") or {}
+        if self.valves.SHOW_USAGE and u:
+            return _completion(
+                model_id,
+                text,
+                _usage(u.get("prompt_tokens"), u.get("completion_tokens")),
+            )
+        return text
 
-    def format_claude_messages(self, messages):
-        # Claude API expects format: [{'role': 'user', 'content': '...'}, {'role': 'assistant', 'content': '...'}]
-        # System prompts handled via a separate 'system' parameter in the main request body
-        formatted_messages = []
-        system_prompt = None
-        last_role = None
-
-        for i, msg in enumerate(messages):
-            role = msg.get("role")
-            content = msg.get("content")
-
-            if not content:
-                continue  # Skip empty content
-
-            if role == "system":
-                if system_prompt is None:  # Capture the first system message
-                    system_prompt = content
-                else:  # Append additional system messages to the main one
-                    system_prompt += "\n" + content
-                continue  # Don't add system messages to the main message list
-
-            # Ensure alternating user/assistant roles, starting with user
-            # If the first non-system message is 'assistant', prepend a dummy user message if required by API
-            if not formatted_messages and role == "assistant":
-                if DEBUG:
-                    print(
-                        "Warning: First message is 'assistant'. Claude API requires starting with 'user'. Prepending empty user message (consider fixing history)."
-                    )
-                # formatted_messages.append({"role": "user", "content": "[Initiating assistant response]"}) # Or handle error
-                # Best practice: Ensure history always starts with user
-
-            # Merge consecutive messages of same role OR handle error
-            if role == last_role:
-                if DEBUG:
-                    print(
-                        f"Warning: Merging consecutive '{role}' messages for Claude API compatibility."
-                    )
-                if formatted_messages:  # Ensure list is not empty
-                    formatted_messages[-1]["content"] += "\n" + content
-                else:  # Should not happen if logic is correct, but handle nonetheless
-                    formatted_messages.append({"role": role, "content": content})
-                continue  # Skip appending separately
-
-            # Add the message
-            formatted_messages.append({"role": role, "content": content})
-            last_role = role
-
-        # Final check: Ensure last message is not assistant if expecting user input next? Typically handled by caller.
-
-        return (
-            formatted_messages,
-            system_prompt,
-        )  # Return both messages and system prompt
-
-    # Generic stream response parser (OpenAI compatible SSE)
-    # Used by call_gemini_model (if using openapi endpoint) and potentially call_llama_model
-    def _stream_response(self, url: str, data: dict) -> Iterator[str]:
-        """Stream the response from an OpenAI-compatible SSE endpoint."""
-        response = self.authed_session.post(
+    def _stream_openai_response(self, url: str, data: dict) -> Iterator[str]:
+        resp = self.authed_session.post(
             url, json=data, stream=True, headers={"Accept": "text/event-stream"}
         )
-
-        if response.status_code != 200:
-            error_message = f"Error: {response.status_code} {response.text}"
-            if DEBUG:
-                print(error_message)
-                print("Response Headers:", response.headers)
-            yield error_message
+        if resp.status_code != 200:
+            yield f"Error: {resp.status_code} {resp.text}"
             return
-
-        if DEBUG:
-            print(f"Starting to stream generic SSE response from {url}")
-
-        for line in response.iter_lines():
-            if line:
-                decoded_line = line.decode("utf-8")
-                if decoded_line.startswith("data: "):
-                    content = decoded_line[len("data: ") :]
-                    if content.strip() == "[DONE]":
-                        if DEBUG:
-                            print("SSE stream finished with [DONE].")
-                        break  # End of stream marker
-                    try:
-                        json_response = json.loads(content)
-                        if DEBUG:
-                            print(
-                                "Streaming generic chunk:",
-                                json.dumps(json_response, indent=2),
-                            )
-
-                        if (
-                            "choices" in json_response
-                            and len(json_response["choices"]) > 0
-                        ):
-                            delta = json_response["choices"][0].get("delta", {})
-                            if "content" in delta and delta["content"] is not None:
-                                yield delta["content"]
-                            # Check for finish reason in the last chunk if needed
-                            # finish_reason = json_response['choices'][0].get('finish_reason')
-                            # if finish_reason:
-                            #     if DEBUG: print(f"Stream finished with reason: {finish_reason}")
-                            #     # Handle finish reason (e.g. safety, length) if necessary
-                            #     if finish_reason == "safety": yield "\n[Error: Response stopped due to safety filter]"
-                            #     elif finish_reason == "length": yield "\n[Warning: Response truncated due to length]"
-                            #     break # Stop on finish reason
-
-                    except json.JSONDecodeError as e:
-                        if DEBUG:
-                            print(
-                                f"Error decoding JSON stream chunk: {e}, Line: '{decoded_line}'"
-                            )
-                        continue
-                    except Exception as e:
-                        if DEBUG:
-                            import traceback
-
-                            print(
-                                f"Error processing generic stream: {e}\n{traceback.format_exc()}"
-                            )
-                        continue
-                elif (
-                    decoded_line.strip()
-                ):  # Handle non-data lines if needed (e.g., error messages not in JSON)
-                    if DEBUG:
-                        print(f"Received non-data line: {decoded_line}")
-
-        if DEBUG:
-            print(f"Finished streaming generic SSE response from {url}")
+        usage: dict = {}
+        for chunk in self._sse_json(resp):
+            usage = chunk.get("usage") or usage
+            choices = chunk.get("choices") or []
+            if choices:
+                content = (choices[0].get("delta") or {}).get("content")
+                if content:
+                    yield content
+        if self.valves.SHOW_USAGE and usage:
+            yield _usage_sse(
+                _usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+            )
